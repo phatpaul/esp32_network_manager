@@ -2,6 +2,7 @@ menu "WiFi Manager"
 
 menuconfig WMNGR_ENABLED
     bool "WiFi Manager"
+    default true
     help
         Select this option to enable the Wifi Manager component
 
