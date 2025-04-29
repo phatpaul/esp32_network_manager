@@ -270,7 +270,61 @@ static esp_err_t set_eth_cfg(struct eth_cfg *cfg)
     return result;
 }
 
-static esp_err_t load_config(void)
+
+/*
+ * Helper to fetch current Ethernet configuration from the system and store it in
+ * a eth_cfg struct.
+ */
+static esp_err_t get_eth_cfg(struct eth_cfg *cfg)
+{
+    esp_netif_dhcp_status_t dhcp_status;
+    unsigned int idx;
+    esp_err_t result;
+
+    result = ESP_OK;
+    memset(cfg, 0x0, sizeof(*cfg));
+
+    result = esp_netif_dhcpc_get_status(eth_netif, &dhcp_status);
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] Error fetching DHCP status.", __func__);
+        goto on_exit;
+    }
+
+    if(dhcp_status == ESP_NETIF_DHCP_STOPPED){
+        cfg->eth_static = 1;
+
+        result = esp_netif_get_ip_info(eth_netif, &cfg->eth_ip_info);
+        if(result != ESP_OK){
+            ESP_LOGE(TAG, "[%s] esp_netif_get_ip_info() STA: %d %s",
+                    __func__, result, esp_err_to_name(result));
+            goto on_exit;
+        }
+
+        for(idx = 0; idx < ARRAY_SIZE(cfg->eth_dns_info); ++idx){
+            result = esp_netif_get_dns_info(eth_netif,
+                                            idx,
+                                            &(cfg->eth_dns_info[idx]));
+            if(result != ESP_OK){
+                ESP_LOGE(TAG, "[%s] Getting DNS server IP failed.",
+                         __func__);
+                goto on_exit;
+            }
+
+        }
+    }
+
+    cfg->is_valid = true;
+
+on_exit:
+    return result;
+}
+
+/**
+ * * @brief Load the configuration from NVS or provide defaults.
+ * @param cfg[out] Pointer to the configuration structure to be filled.
+ * @return ESP_OK if config was set, ESP_ERR_* otherwise.
+ */
+static esp_err_t get_effective_config(struct eth_cfg *cfg)
 {
     esp_err_t result = ESP_OK;
     struct eth_cfg cfg_state;
@@ -288,40 +342,29 @@ static esp_err_t load_config(void)
     /* Any config read from NVS or restored from defaults should be valid. */
     cfg_state.is_valid = true;
 
-    // Apply the configuration to the Ethernet interface
-    return set_eth_cfg(&cfg_state);
+    return result;
 }
-
-// static void example_set_static_ip(esp_netif_t *netif)
-// {
-//     if (esp_netif_dhcpc_stop(netif) != ESP_OK) {
-//         ESP_LOGE(TAG, "Failed to stop dhcp client");
-//         return;
-//     }
-//     esp_netif_ip_info_t ip;
-//     memset(&ip, 0 , sizeof(esp_netif_ip_info_t));
-//     ip.ip.addr = ipaddr_addr(EXAMPLE_STATIC_IP_ADDR);
-//     ip.netmask.addr = ipaddr_addr(EXAMPLE_STATIC_NETMASK_ADDR);
-//     ip.gw.addr = ipaddr_addr(EXAMPLE_STATIC_GW_ADDR);
-//     if (esp_netif_set_ip_info(netif, &ip) != ESP_OK) {
-//         ESP_LOGE(TAG, "Failed to set ip info");
-//         return;
-//     }
-//     ESP_LOGD(TAG, "Set static ip: %s, netmask: %s, gw: %s", EXAMPLE_STATIC_IP_ADDR, EXAMPLE_STATIC_NETMASK_ADDR, EXAMPLE_STATIC_GW_ADDR);
-//     example_set_dns_server(netif, ipaddr_addr(EXAMPLE_MAIN_DNS_SERVER), ESP_NETIF_DNS_MAIN);
-//     example_set_dns_server(netif, ipaddr_addr(EXAMPLE_BACKUP_DNS_SERVER), ESP_NETIF_DNS_BACKUP);
-// }
 
 /** Set a new Network Manager configuration.
  *
  * @param[in] new New WiFi Manager configuration to be set.
  * @return ESP_OK if config was set, ESP_ERR_* otherwise.
  */
-esp_err_t netman_set_eth_cfg(struct eth_cfg *new)
+esp_err_t netman_set_eth_cfg(struct eth_cfg *new_cfg)
 {
     // TODO: make this use the asynchronous mechanism, just hacked for now
-    save_config(new);
-    return load_config();
+    save_config(new_cfg);
+    return set_eth_cfg(new_cfg);
+}
+
+/**
+ * @brief Get the current Network Manager configuration.
+ * @param[out] new_cfg Pointer to the configuration structure to be filled.
+ * @return ESP_OK if config was set, ESP_ERR_* otherwise.
+ */
+esp_err_t netman_get_eth_cfg(struct eth_cfg *new_cfg)
+{
+    return get_effective_config(new_cfg);
 }
 
 /** Event handler for Ethernet events */
@@ -383,7 +426,7 @@ esp_err_t eth_manager_set_hostname(const char *hostname)
 }
 
 /**
- * @brief Initialize the Ethernet manager. 
+ * @brief Initialize the Ethernet manager.
  * Do this after initializing the Ethernet driver and Initialize TCP/IP network interface.
  *
  * @param eth_handle Pointer to the Ethernet handle which was created by esp_eth_driver_install()
@@ -436,11 +479,19 @@ esp_err_t eth_manager_init(esp_eth_handle_t *eth_handle)
     }
 
     // Load the saved configuration from NVS
-    err = load_config();
+    struct eth_cfg cfg_state;
+    err = get_effective_config(&cfg_state);
     if (err != 0)
     {
         goto error;
     }
+    // Set the configuration to the Ethernet interface
+    err = set_eth_cfg(&cfg_state);
+    if (err != 0)
+    {
+        goto error;
+    }
+
 
     return 0;
 error:
