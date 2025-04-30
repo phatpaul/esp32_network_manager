@@ -1,26 +1,64 @@
+/*
+ * This file is part of the ESP WiFi Manager project.
+ * Copyright (C) 2019  Tido Klaassen <tido_wmngr@4gh.eu>
+ * Ethernet Manager added by Paul Abbott 2025
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ * MA  02110-1301, USA.
+ */
+
 #include "eth_manager.h"
 
 #include <string.h>
-// #define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
-#include "esp_log.h"
+#include <stdatomic.h>
+#include <errno.h>
+#include <sys/param.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
+#include "freertos/event_groups.h"
+
 #include "esp_event.h"
 #include "esp_eth.h"
 #include "esp_netif.h"
 #include "esp_err.h"
-
 #include "nvs_flash.h"
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#include "esp_log.h"
+
 #include "lwip/ip4.h"
 #include "lwip/ip_addr.h"
 
-#define ETH_USE_IPV6 (CONFIG_LWIP_IPV6)
-#define WMNGR_NAMESPACE "esp_netman"
-#define NVS_CFG_VER     1
-
+#include "kutils.h"
+#include "kref.h"
 
 static const char *TAG = "eth_manager";
 
+#define WMNGR_NAMESPACE "eth_manager"
+#define NVS_CFG_VER     1
+#define ETH_USE_IPV6 (CONFIG_LWIP_IPV6)
+
+/* For keeping track of system events. */
+#define BIT_ETH_START           BIT1
+#define BIT_ETH_CONNECTED       BIT2
+#define BIT_ETH_GOT_IP          BIT3
+#define BIT_STOPPED      BIT10
+
 static esp_netif_t *eth_netif = NULL;
 
+static EventGroupHandle_t eth_events = NULL;
 
 /** Set configuration from compiled-in defaults.
  */
@@ -217,10 +255,17 @@ on_exit:
     return result;
 }
 
-#if !defined(ARRAY_SIZE)
-#define ARRAY_SIZE(a)   (sizeof(a) / sizeof((a)[0]))
-#endif
+/* Helper function to check if WiFi is connected in station mode. */
+static bool eth_connected(void)
+{
+    EventBits_t events;
 
+    events = xEventGroupGetBits(eth_events);
+
+    return !!(events & BIT_ETH_CONNECTED);
+}
+
+/* Helper function to set Ethernet configuration from struct eth_cfg. */
 static esp_err_t set_eth_cfg(struct eth_cfg *cfg)
 {
     unsigned int idx;
@@ -270,6 +315,53 @@ static esp_err_t set_eth_cfg(struct eth_cfg *cfg)
     return result;
 }
 
+static bool cfgs_are_equal(struct eth_cfg *a, struct eth_cfg *b)
+{
+    unsigned int idx;
+    bool result;
+
+    result = false;
+
+    /*
+     * Do some naive checks to see if the new configuration is an actual
+     * change. Should be more thorough by actually comparing the elements.
+     */
+    if (a->eth_connect != b->eth_connect) {
+        goto on_exit;
+    }
+
+    if (a->eth_static != b->eth_static) {
+        goto on_exit;
+    }
+
+
+    if (a->eth_static) {
+        if (!ip4_addr_cmp(&(a->eth_ip_info.ip), &(b->eth_ip_info.ip))) {
+            goto on_exit;
+        }
+
+        if (!ip4_addr_cmp(&(a->eth_ip_info.netmask), &(b->eth_ip_info.netmask))) {
+            goto on_exit;
+        }
+
+        if (!ip4_addr_cmp(&(a->eth_ip_info.gw), &(b->eth_ip_info.gw))) {
+            goto on_exit;
+        }
+
+        for (idx = 0; idx < ARRAY_SIZE(a->eth_dns_info); ++idx) {
+            if (!ip_addr_cmp(&(a->eth_dns_info[idx].ip),
+                &(b->eth_dns_info[idx].ip)))
+            {
+                goto on_exit;
+            }
+        }
+    }
+
+    result = true;
+
+on_exit:
+    return result;
+}
 
 /*
  * Helper to fetch current Ethernet configuration from the system and store it in
@@ -284,29 +376,31 @@ static esp_err_t get_eth_cfg(struct eth_cfg *cfg)
     result = ESP_OK;
     memset(cfg, 0x0, sizeof(*cfg));
 
+    // See if DHCP is enabled on the Ethernet interface
     result = esp_netif_dhcpc_get_status(eth_netif, &dhcp_status);
-    if(result != ESP_OK){
+    if (result != ESP_OK) {
         ESP_LOGE(TAG, "[%s] Error fetching DHCP status.", __func__);
         goto on_exit;
     }
 
-    if(dhcp_status == ESP_NETIF_DHCP_STOPPED){
+    // If DHCP is stopped on Ethernet interface, assume static IP
+    if (dhcp_status == ESP_NETIF_DHCP_STOPPED) {
         cfg->eth_static = 1;
 
         result = esp_netif_get_ip_info(eth_netif, &cfg->eth_ip_info);
-        if(result != ESP_OK){
+        if (result != ESP_OK) {
             ESP_LOGE(TAG, "[%s] esp_netif_get_ip_info() STA: %d %s",
-                    __func__, result, esp_err_to_name(result));
+                __func__, result, esp_err_to_name(result));
             goto on_exit;
         }
 
-        for(idx = 0; idx < ARRAY_SIZE(cfg->eth_dns_info); ++idx){
+        for (idx = 0; idx < ARRAY_SIZE(cfg->eth_dns_info); ++idx) {
             result = esp_netif_get_dns_info(eth_netif,
-                                            idx,
-                                            &(cfg->eth_dns_info[idx]));
-            if(result != ESP_OK){
+                idx,
+                &(cfg->eth_dns_info[idx]));
+            if (result != ESP_OK) {
                 ESP_LOGE(TAG, "[%s] Getting DNS server IP failed.",
-                         __func__);
+                    __func__);
                 goto on_exit;
             }
 
@@ -345,12 +439,160 @@ static esp_err_t get_effective_config(struct eth_cfg *cfg)
     return result;
 }
 
+/** Event handler for Ethernet events */
+static void eth_event_handler(void *esp_netif, esp_event_base_t event_base,
+    int32_t event_id, void *event_data)
+{
+    uint8_t mac_addr[6] = {0};
+    /* we can get the ethernet driver handle from event data */
+    esp_eth_handle_t eth_handle = *(esp_eth_handle_t *)event_data;
+
+    if (WIFI_EVENT == event_base) {
+        switch (event_id)
+        {
+        case ETHERNET_EVENT_CONNECTED:
+            esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, &mac_addr[0]);
+            ESP_LOGI(TAG, "Ethernet Link Up. HW Addr %02x:%02x:%02x:%02x:%02x:%02x",
+                mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+
+            // Set static IP address
+            //example_set_static_ip(esp_netif);
+
+#if ETH_USE_IPV6
+            esp_netif_create_ip6_linklocal(esp_netif);
+#endif // ETH_USE_IPV6
+            break;
+        case ETHERNET_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "Ethernet Link Down");
+            xEventGroupClearBits(eth_events, BIT_ETH_CONNECTED);
+            break;
+        case ETHERNET_EVENT_START:
+            xEventGroupSetBits(eth_events, BIT_ETH_START);
+            ESP_LOGI(TAG, "Ethernet Started");
+            break;
+        case ETHERNET_EVENT_STOP:
+            xEventGroupClearBits(eth_events, BIT_ETH_START);
+            ESP_LOGI(TAG, "Ethernet Stopped");
+            break;
+        default:
+            break;
+        }
+    }
+
+    if (IP_EVENT == event_base) {
+        switch (event_id) {
+        case IP_EVENT_STA_GOT_IP:
+            xEventGroupSetBits(eth_events, BIT_ETH_GOT_IP);
+            break;
+        case IP_EVENT_STA_LOST_IP:
+            xEventGroupClearBits(eth_events, BIT_ETH_GOT_IP);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+/*****************************************************************************\
+ *  API functions                                                            *
+\*****************************************************************************/
+
+/** Initialize the Ethernet Manager.
+ *
+ * Calling this function will initialise the Ethernet Manger. It must be called
+ * after initialising the NVS, default event loop, Ethernet Driver, and TCP adapter and before
+ * calling any other esp_wmngr function.
+ *
+ * @param eth_handle Pointer to the Ethernet handle which was created by esp_eth_driver_install()
+ * @return int 0: success, other: error code
+ */
+esp_err_t eth_manager_init(esp_eth_handle_t *eth_handle)
+{
+
+    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
+    esp_err_t result = ESP_OK;
+
+    configASSERT(eth_handle != NULL);
+    configASSERT(eth_events == NULL);
+
+    eth_events = xEventGroupCreate();
+    if (NULL == eth_events) {
+        ESP_LOGE(TAG, "Unable to create event group.");
+        result = ESP_ERR_NO_MEM;
+        goto on_exit;
+    }
+
+    /* Make sure we do not handle any events until we have been started. */
+    xEventGroupSetBits(eth_events, BIT_STOPPED);
+
+
+    eth_netif = esp_netif_new(&cfg);
+    if (NULL == eth_netif)
+    {
+        goto on_exit;
+    }
+    // Set default handlers to process TCP/IP stuffs -- NOT NEEDED in IDF v4+
+    // err = esp_eth_set_default_handlers(eth_netif);
+    // if (err != 0)
+    // {
+    //     goto on_exit;
+    // }
+
+    /* attach Ethernet driver to TCP/IP stack */
+    result = esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle));
+    if (ESP_OK != result)
+    {
+        goto on_exit;
+    }
+    // Register user defined event handers
+    result = esp_event_handler_instance_register(ETH_EVENT,
+        ESP_EVENT_ANY_ID,
+        &eth_event_handler,
+        eth_netif,
+        NULL);
+    if (ESP_OK != result)
+    {
+        goto on_exit;
+    }
+    /* start Ethernet driver state machine */
+    result = esp_eth_start(eth_handle);
+    if (ESP_OK != result)
+    {
+        goto on_exit;
+    }
+
+    // Load the saved configuration from NVS
+    struct eth_cfg cfg_state;
+    result = get_effective_config(&cfg_state);
+    if (ESP_OK != result)
+    {
+        goto on_exit;
+    }
+    // Set the configuration to the Ethernet interface
+    result = set_eth_cfg(&cfg_state);
+    if (ESP_OK != result)
+    {
+        goto on_exit;
+    }
+
+on_exit:
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to start Ethernet. code:%d", result);
+        if (eth_events != NULL) {
+            vEventGroupDelete(eth_events);
+            eth_events = NULL;
+        }
+    }
+
+    return result;
+}
+
 /** Set a new Network Manager configuration.
  *
  * @param[in] new New WiFi Manager configuration to be set.
  * @return ESP_OK if config was set, ESP_ERR_* otherwise.
  */
-esp_err_t netman_set_eth_cfg(struct eth_cfg *new_cfg)
+esp_err_t eth_manager_set_eth_cfg(struct eth_cfg *new_cfg)
 {
     // TODO: make this use the asynchronous mechanism, just hacked for now
     save_config(new_cfg);
@@ -362,46 +604,17 @@ esp_err_t netman_set_eth_cfg(struct eth_cfg *new_cfg)
  * @param[out] new_cfg Pointer to the configuration structure to be filled.
  * @return ESP_OK if config was set, ESP_ERR_* otherwise.
  */
-esp_err_t netman_get_eth_cfg(struct eth_cfg *new_cfg)
+esp_err_t eth_manager_get_eth_cfg(struct eth_cfg *new_cfg)
 {
     return get_effective_config(new_cfg);
 }
 
-/** Event handler for Ethernet events */
-static void eth_event_handler(void *esp_netif, esp_event_base_t event_base,
-    int32_t event_id, void *event_data)
+/** Query current connection status.
+ * @return true if device is connected to Ethernet, false otherwise
+ */
+bool eth_manager_eth_is_connected(void)
 {
-    uint8_t mac_addr[6] = {0};
-    /* we can get the ethernet driver handle from event data */
-    esp_eth_handle_t eth_handle = *(esp_eth_handle_t *)event_data;
-
-    switch (event_id)
-    {
-    case ETHERNET_EVENT_CONNECTED:
-        esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, &mac_addr[0]);
-        ESP_LOGI(TAG, "Ethernet Link Up. HW Addr %02x:%02x:%02x:%02x:%02x:%02x",
-            mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-
-        // Set static IP address
-        //example_set_static_ip(esp_netif);
-
-#if ETH_USE_IPV6
-        esp_netif_create_ip6_linklocal(esp_netif);
-        ////esp_netif_create_ip6_linklocal(get_esp_interface_netif(ESP_IF_ETH));
-#endif // ETH_USE_IPV6
-        break;
-    case ETHERNET_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "Ethernet Link Down");
-        break;
-    case ETHERNET_EVENT_START:
-        ESP_LOGI(TAG, "Ethernet Started");
-        break;
-    case ETHERNET_EVENT_STOP:
-        ESP_LOGI(TAG, "Ethernet Stopped");
-        break;
-    default:
-        break;
-    }
+    return eth_connected();
 }
 
 // Set the hostname on the Ethernet interface
@@ -424,79 +637,3 @@ esp_err_t eth_manager_set_hostname(const char *hostname)
 
     return ESP_OK;
 }
-
-/**
- * @brief Initialize the Ethernet manager.
- * Do this after initializing the Ethernet driver and Initialize TCP/IP network interface.
- *
- * @param eth_handle Pointer to the Ethernet handle which was created by esp_eth_driver_install()
- * @return int 0: success, other: error code
- */
-esp_err_t eth_manager_init(esp_eth_handle_t *eth_handle)
-{
-    esp_err_t err = ESP_OK;
-
-    if (NULL == eth_handle)
-    {
-        ESP_LOGE(TAG, "eth_handle is NULL");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
-    eth_netif = esp_netif_new(&cfg);
-    if (NULL == eth_netif)
-    {
-        goto error;
-    }
-    // Set default handlers to process TCP/IP stuffs -- NOT NEEDED in IDF v4+
-    // err = esp_eth_set_default_handlers(eth_netif);
-    // if (err != 0)
-    // {
-    //     goto error;
-    // }
-
-    /* attach Ethernet driver to TCP/IP stack */
-    err = esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle));
-    if (err != 0)
-    {
-        goto error;
-    }
-    // Register user defined event handers
-    err = esp_event_handler_instance_register(ETH_EVENT,
-        ESP_EVENT_ANY_ID,
-        &eth_event_handler,
-        eth_netif,
-        NULL);
-    if (err != 0)
-    {
-        goto error;
-    }
-    /* start Ethernet driver state machine */
-    err = esp_eth_start(eth_handle);
-    if (err != 0)
-    {
-        goto error;
-    }
-
-    // Load the saved configuration from NVS
-    struct eth_cfg cfg_state;
-    err = get_effective_config(&cfg_state);
-    if (err != 0)
-    {
-        goto error;
-    }
-    // Set the configuration to the Ethernet interface
-    err = set_eth_cfg(&cfg_state);
-    if (err != 0)
-    {
-        goto error;
-    }
-
-
-    return 0;
-error:
-    ESP_LOGW(TAG, "Failed to start Ethernet. code:%d", err);
-    return err;
-}
-
-

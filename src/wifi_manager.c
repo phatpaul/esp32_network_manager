@@ -18,6 +18,7 @@
  * MA  02110-1301, USA.
  */
 
+#include "wifi_manager.h"
 
 #include <string.h>
 #include <stdatomic.h>
@@ -40,7 +41,6 @@
 #include "lwip/ip4.h"
 #include "lwip/ip_addr.h"
 
-#include "wifi_manager.h"
 #include "kutils.h"
 #include "kref.h"
 

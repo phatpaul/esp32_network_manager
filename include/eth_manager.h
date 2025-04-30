@@ -31,8 +31,9 @@ struct eth_cfg {
     bool eth_connect;   /*!< True if device should connect to Ethernet (false to disable Ethernet interface). */
 };
 
-esp_err_t netman_set_eth_cfg(struct eth_cfg *new_cfg);
-esp_err_t netman_get_eth_cfg(struct eth_cfg *get_cfg);
+esp_err_t eth_manager_set_eth_cfg(struct eth_cfg *new_cfg);
+esp_err_t eth_manager_get_eth_cfg(struct eth_cfg *get_cfg);
+bool eth_manager_eth_is_connected(void);
 esp_err_t eth_manager_set_hostname(const char *hostname);
 esp_err_t eth_manager_init(esp_eth_handle_t *eth_handle);
 

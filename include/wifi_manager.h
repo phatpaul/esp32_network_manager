@@ -27,6 +27,7 @@
 #include "esp_err.h"
 #include "esp_wifi_types.h"
 #include "esp_netif.h"
+#include "freertos/FreeRTOS.h" // for TickType_t
 
 /** A set of AP scan data. */
 struct scan_data {
