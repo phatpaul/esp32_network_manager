@@ -64,11 +64,11 @@ static EventGroupHandle_t eth_events = NULL;
  */
 static void set_defaults(struct eth_cfg *cfg)
 {
-    memset(cfg, 0x0, sizeof(*cfg));
+    eth_cfg_init(cfg);
     cfg->is_default = true;
     cfg->is_valid = true;
     cfg->eth_static = false;
-    cfg->eth_connect = true;
+    cfg->eth_disable = false;
 }
 
 /** Read saved configuration from NVS.
@@ -86,7 +86,7 @@ static esp_err_t get_saved_config(struct eth_cfg *cfg)
 
     result = ESP_OK;
 
-    memset(cfg, 0x0, sizeof(*cfg));
+    eth_cfg_init(cfg);
 
     result = nvs_open(WMNGR_NAMESPACE, NVS_READONLY, &handle);
     if (result != ESP_OK) {
@@ -111,11 +111,11 @@ static esp_err_t get_saved_config(struct eth_cfg *cfg)
     }
     cfg->eth_static = (bool)tmp;
 
-    result = nvs_get_u32(handle, "eth_connect", &tmp);
+    result = nvs_get_u32(handle, "eth_disable", &tmp);
     if (result != ESP_OK) {
         goto on_exit;
     }
-    cfg->eth_connect = (bool)tmp;
+    cfg->eth_disable = (bool)tmp;
 
     len = sizeof(cfg->eth_ip_info);
     result = nvs_get_blob(handle, "eth_ip", &(cfg->eth_ip_info), &len);
@@ -223,7 +223,7 @@ static esp_err_t save_config(struct eth_cfg *cfg)
         goto on_exit;
     }
 
-    result = nvs_set_u32(handle, "eth_connect", cfg->eth_connect);
+    result = nvs_set_u32(handle, "eth_disable", cfg->eth_disable);
     if (result != ESP_OK) {
         goto on_exit;
     }
@@ -259,7 +259,10 @@ on_exit:
 static bool eth_connected(void)
 {
     EventBits_t events;
-
+    if (NULL == eth_events) {
+        ESP_LOGE(TAG, "not initialized");
+        return false;
+    }
     events = xEventGroupGetBits(eth_events);
 
     return !!(events & BIT_ETH_CONNECTED);
@@ -304,12 +307,12 @@ static esp_err_t set_eth_cfg(struct eth_cfg *cfg)
         }
     }
 
-    if (cfg->eth_connect)
+    if (cfg->eth_disable)
     {
-        // Todo enable ethernet interface
+        // Todo disable ethernet interface
     }
     else {
-        // Todo disable ethernet interface
+        // Todo enable ethernet interface
     }
 
     return result;
@@ -326,7 +329,7 @@ static bool cfgs_are_equal(struct eth_cfg *a, struct eth_cfg *b)
      * Do some naive checks to see if the new configuration is an actual
      * change. Should be more thorough by actually comparing the elements.
      */
-    if (a->eth_connect != b->eth_connect) {
+    if (a->eth_disable != b->eth_disable) {
         goto on_exit;
     }
 
@@ -363,18 +366,56 @@ on_exit:
     return result;
 }
 
+
+/**
+ * * @brief Load the configuration from NVS or provide defaults.
+ * @param cfg[out] Pointer to the configuration structure to be filled.
+ * @return ESP_OK if config was set, ESP_ERR_* otherwise.
+ */
+static esp_err_t get_saved_or_default_config(struct eth_cfg *cfg_state)
+{
+    esp_err_t result = ESP_OK;
+    /*
+     * Restore saved WiFi config or fall back to compiled-in defaults.
+     * Setting state to update will trigger applying this config.
+     */
+    result = get_saved_config(cfg_state);
+    if (result != ESP_OK) {
+        ESP_LOGI(TAG, "[%s] No saved config found, setting defaults",
+            __func__);
+        set_defaults(cfg_state);
+        result = ESP_OK;
+    }
+
+    /* Any config read from NVS or restored from defaults should be valid. */
+    cfg_state->is_valid = true;
+
+    return result;
+}
+
 /*
- * Helper to fetch current Ethernet configuration from the system and store it in
+ * Helper to fetch current Ethernet state from the system and return it in
  * a eth_cfg struct.
  */
-static esp_err_t get_eth_cfg(struct eth_cfg *cfg)
+static esp_err_t get_eth_state(struct eth_cfg *cfg)
 {
     esp_netif_dhcp_status_t dhcp_status;
     unsigned int idx;
     esp_err_t result;
 
     result = ESP_OK;
-    memset(cfg, 0x0, sizeof(*cfg));
+    eth_cfg_init(cfg);
+
+    bool connected = eth_connected();
+    if (!connected) {
+        // not currently connected, so just return default config settings
+        result = get_saved_or_default_config(cfg);
+        cfg->is_connected = false;
+        goto on_exit;
+    }
+
+    // Else we are connected, so get the current state
+    cfg->is_connected = true;
 
     // See if DHCP is enabled on the Ethernet interface
     result = esp_netif_dhcpc_get_status(eth_netif, &dhcp_status);
@@ -384,26 +425,25 @@ static esp_err_t get_eth_cfg(struct eth_cfg *cfg)
     }
 
     // If DHCP is stopped on Ethernet interface, assume static IP
-    if (dhcp_status == ESP_NETIF_DHCP_STOPPED) {
+    if (ESP_NETIF_DHCP_STOPPED == dhcp_status) {
         cfg->eth_static = 1;
+    }
 
-        result = esp_netif_get_ip_info(eth_netif, &cfg->eth_ip_info);
+    result = esp_netif_get_ip_info(eth_netif, &cfg->eth_ip_info);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "[%s] esp_netif_get_ip_info() STA: %d %s",
+            __func__, result, esp_err_to_name(result));
+        goto on_exit;
+    }
+
+    for (idx = 0; idx < ARRAY_SIZE(cfg->eth_dns_info); ++idx) {
+        result = esp_netif_get_dns_info(eth_netif,
+            idx,
+            &(cfg->eth_dns_info[idx]));
         if (result != ESP_OK) {
-            ESP_LOGE(TAG, "[%s] esp_netif_get_ip_info() STA: %d %s",
-                __func__, result, esp_err_to_name(result));
+            ESP_LOGE(TAG, "[%s] Getting DNS server IP failed.",
+                __func__);
             goto on_exit;
-        }
-
-        for (idx = 0; idx < ARRAY_SIZE(cfg->eth_dns_info); ++idx) {
-            result = esp_netif_get_dns_info(eth_netif,
-                idx,
-                &(cfg->eth_dns_info[idx]));
-            if (result != ESP_OK) {
-                ESP_LOGE(TAG, "[%s] Getting DNS server IP failed.",
-                    __func__);
-                goto on_exit;
-            }
-
         }
     }
 
@@ -413,54 +453,29 @@ on_exit:
     return result;
 }
 
-/**
- * * @brief Load the configuration from NVS or provide defaults.
- * @param cfg[out] Pointer to the configuration structure to be filled.
- * @return ESP_OK if config was set, ESP_ERR_* otherwise.
- */
-static esp_err_t get_effective_config(struct eth_cfg *cfg)
-{
-    esp_err_t result = ESP_OK;
-    struct eth_cfg cfg_state;
-    /*
-     * Restore saved WiFi config or fall back to compiled-in defaults.
-     * Setting state to update will trigger applying this config.
-     */
-    result = get_saved_config(&cfg_state);
-    if (result != ESP_OK) {
-        ESP_LOGI(TAG, "[%s] No saved config found, setting defaults",
-            __func__);
-        set_defaults(&cfg_state);
-    }
-
-    /* Any config read from NVS or restored from defaults should be valid. */
-    cfg_state.is_valid = true;
-
-    return result;
-}
-
 /** Event handler for Ethernet events */
 static void eth_event_handler(void *esp_netif, esp_event_base_t event_base,
     int32_t event_id, void *event_data)
 {
-    uint8_t mac_addr[6] = {0};
-    /* we can get the ethernet driver handle from event data */
-    esp_eth_handle_t eth_handle = *(esp_eth_handle_t *)event_data;
 
-    if (WIFI_EVENT == event_base) {
+
+    if (ETH_EVENT == event_base) {
         switch (event_id)
         {
         case ETHERNET_EVENT_CONNECTED:
-            esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, &mac_addr[0]);
-            ESP_LOGI(TAG, "Ethernet Link Up. HW Addr %02x:%02x:%02x:%02x:%02x:%02x",
-                mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-
-            // Set static IP address
-            //example_set_static_ip(esp_netif);
-
+            xEventGroupSetBits(eth_events, BIT_ETH_CONNECTED);
 #if ETH_USE_IPV6
             esp_netif_create_ip6_linklocal(esp_netif);
 #endif // ETH_USE_IPV6
+            if (LOG_LOCAL_LEVEL >= ESP_LOG_INFO)
+            {
+                uint8_t mac_addr[6] = { 0 };
+                /* we can get the ethernet driver handle from event data */
+                esp_eth_handle_t eth_handle = *(esp_eth_handle_t *)event_data;
+                esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, &mac_addr[0]);
+                ESP_LOGI(TAG, "Ethernet Link Up. HW Addr %02x:%02x:%02x:%02x:%02x:%02x",
+                    mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+            }
             break;
         case ETHERNET_EVENT_DISCONNECTED:
             ESP_LOGI(TAG, "Ethernet Link Down");
@@ -479,18 +494,18 @@ static void eth_event_handler(void *esp_netif, esp_event_base_t event_base,
         }
     }
 
-    if (IP_EVENT == event_base) {
-        switch (event_id) {
-        case IP_EVENT_STA_GOT_IP:
-            xEventGroupSetBits(eth_events, BIT_ETH_GOT_IP);
-            break;
-        case IP_EVENT_STA_LOST_IP:
-            xEventGroupClearBits(eth_events, BIT_ETH_GOT_IP);
-            break;
-        default:
-            break;
-        }
-    }
+    // if (IP_EVENT == event_base) {
+    //     switch (event_id) {
+    //     case IP_EVENT_STA_GOT_IP:
+    //         xEventGroupSetBits(eth_events, BIT_ETH_GOT_IP);
+    //         break;
+    //     case IP_EVENT_STA_LOST_IP:
+    //         xEventGroupClearBits(eth_events, BIT_ETH_GOT_IP);
+    //         break;
+    //     default:
+    //         break;
+    //     }
+    // }
 }
 
 /*****************************************************************************\
@@ -563,7 +578,7 @@ esp_err_t eth_manager_init(esp_eth_handle_t *eth_handle)
 
     // Load the saved configuration from NVS
     struct eth_cfg cfg_state;
-    result = get_effective_config(&cfg_state);
+    result = get_saved_or_default_config(&cfg_state);
     if (ESP_OK != result)
     {
         goto on_exit;
@@ -606,15 +621,15 @@ esp_err_t eth_manager_set_eth_cfg(struct eth_cfg *new_cfg)
  */
 esp_err_t eth_manager_get_eth_cfg(struct eth_cfg *new_cfg)
 {
-    return get_effective_config(new_cfg);
+    return get_saved_or_default_config(new_cfg);
 }
 
 /** Query current connection status.
  * @return true if device is connected to Ethernet, false otherwise
  */
-bool eth_manager_eth_is_connected(void)
+esp_err_t eth_manager_get_eth_state(struct eth_cfg *get_state)
 {
-    return eth_connected();
+    return get_eth_state(get_state);
 }
 
 // Set the hostname on the Ethernet interface
