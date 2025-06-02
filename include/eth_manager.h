@@ -21,16 +21,14 @@ struct eth_cfg {
     bool is_default;    /*!< True if this is the factory default config. */
     bool is_valid;      /*!< True if this config has been applied successfully
                              before. */
-    bool is_connected;   /*!< True if the Ethernet interface is connected.
+    bool is_connected;   /*!< True if the interface is connected.
     (is_connected is only used for eth_manager_get_eth_state) */
-
-    bool eth_static;    /*!< True if ETH interface should use static IP and DNS
+    bool is_disabled;   /*!< True to disable interface. */
+    bool is_static;    /*!< True if interface should use static IP and DNS
                              configuration. When false, DHCP will be used. */
-    esp_netif_ip_info_t eth_ip_info;
-    /*!< The IP address of the STA interface in static mode.*/
-    esp_netif_dns_info_t eth_dns_info[ESP_NETIF_DNS_MAX];
-    /*!< IP addresses of DNS servers to use in static IP mode. */
-    bool eth_disable;   /*!< True to disable Ethernet interface. */
+    esp_netif_ip_info_t ip_info;
+    /*!< The IP address of the interface.*/
+    esp_netif_dns_info_t dns_info[ESP_NETIF_DNS_MAX];
 };
 static inline void eth_cfg_init(struct eth_cfg *cfg)
 {

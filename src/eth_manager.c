@@ -67,8 +67,8 @@ static void set_defaults(struct eth_cfg *cfg)
     eth_cfg_init(cfg);
     cfg->is_default = true;
     cfg->is_valid = true;
-    cfg->eth_static = false;
-    cfg->eth_disable = false;
+    cfg->is_static = false;
+    cfg->is_disabled = false;
 }
 
 /** Read saved configuration from NVS.
@@ -109,24 +109,24 @@ static esp_err_t get_saved_config(struct eth_cfg *cfg)
     if (result != ESP_OK) {
         goto on_exit;
     }
-    cfg->eth_static = (bool)tmp;
+    cfg->is_static = (bool)tmp;
 
     result = nvs_get_u32(handle, "eth_disable", &tmp);
     if (result != ESP_OK) {
         goto on_exit;
     }
-    cfg->eth_disable = (bool)tmp;
+    cfg->is_disabled = (bool)tmp;
 
-    len = sizeof(cfg->eth_ip_info);
-    result = nvs_get_blob(handle, "eth_ip", &(cfg->eth_ip_info), &len);
-    if (result != ESP_OK || len != sizeof(cfg->eth_ip_info)) {
+    len = sizeof(cfg->ip_info);
+    result = nvs_get_blob(handle, "eth_ip", &(cfg->ip_info), &len);
+    if (result != ESP_OK || len != sizeof(cfg->ip_info)) {
         result = (result != ESP_OK) ? result : ESP_ERR_NOT_FOUND;
         goto on_exit;
     }
 
-    len = sizeof(cfg->eth_dns_info);
-    result = nvs_get_blob(handle, "eth_dns", &(cfg->eth_dns_info), &len);
-    if (result != ESP_OK || len != sizeof(cfg->eth_dns_info)) {
+    len = sizeof(cfg->dns_info);
+    result = nvs_get_blob(handle, "eth_dns", &(cfg->dns_info), &len);
+    if (result != ESP_OK || len != sizeof(cfg->dns_info)) {
         result = (result != ESP_OK) ? result : ESP_ERR_NOT_FOUND;
         goto on_exit;
     }
@@ -218,26 +218,26 @@ static esp_err_t save_config(struct eth_cfg *cfg)
         goto on_exit;
     }
 
-    result = nvs_set_u32(handle, "eth_static", cfg->eth_static);
+    result = nvs_set_u32(handle, "eth_static", cfg->is_static);
     if (result != ESP_OK) {
         goto on_exit;
     }
 
-    result = nvs_set_u32(handle, "eth_disable", cfg->eth_disable);
+    result = nvs_set_u32(handle, "eth_disable", cfg->is_disabled);
     if (result != ESP_OK) {
         goto on_exit;
     }
 
     /* Store the esp-idf types as blobs. */
     /* FIXME: we should also store them component-wise. */
-    result = nvs_set_blob(handle, "eth_ip", &(cfg->eth_ip_info),
-        sizeof(cfg->eth_ip_info));
+    result = nvs_set_blob(handle, "eth_ip", &(cfg->ip_info),
+        sizeof(cfg->ip_info));
     if (result != ESP_OK) {
         goto on_exit;
     }
 
-    result = nvs_set_blob(handle, "eth_dns", &(cfg->eth_dns_info),
-        sizeof(cfg->eth_dns_info));
+    result = nvs_set_blob(handle, "eth_dns", &(cfg->dns_info),
+        sizeof(cfg->dns_info));
     if (result != ESP_OK) {
         goto on_exit;
     }
@@ -276,23 +276,23 @@ static esp_err_t set_eth_cfg(struct eth_cfg *cfg)
 
     ESP_LOGD(TAG, "[%s] Called.", __FUNCTION__);
 
-    if (cfg->eth_static) {
+    if (cfg->is_static) {
         (void)esp_netif_dhcpc_stop(eth_netif);
 
-        result = esp_netif_set_ip_info(eth_netif, &cfg->eth_ip_info);
+        result = esp_netif_set_ip_info(eth_netif, &cfg->ip_info);
         if (result != ESP_OK) {
             ESP_LOGE(TAG, "[%s] esp_netif_set_ip_info() STA: %d %s",
                 __func__, result, esp_err_to_name(result));
         }
 
-        for (idx = 0; idx < ARRAY_SIZE(cfg->eth_dns_info); ++idx) {
-            if (ip_addr_isany_val(cfg->eth_dns_info[idx].ip)) {
+        for (idx = 0; idx < ARRAY_SIZE(cfg->dns_info); ++idx) {
+            if (ip_addr_isany_val(cfg->dns_info[idx].ip)) {
                 continue;
             }
 
             result = esp_netif_set_dns_info(eth_netif,
                 idx,
-                &(cfg->eth_dns_info[idx]));
+                &(cfg->dns_info[idx]));
             if (result != ESP_OK) {
                 ESP_LOGE(TAG, "[%s] Setting DNS server IP failed.",
                     __func__);
@@ -307,7 +307,7 @@ static esp_err_t set_eth_cfg(struct eth_cfg *cfg)
         }
     }
 
-    if (cfg->eth_disable)
+    if (cfg->is_disabled)
     {
         // Todo disable ethernet interface
     }
@@ -329,31 +329,31 @@ static bool cfgs_are_equal(struct eth_cfg *a, struct eth_cfg *b)
      * Do some naive checks to see if the new configuration is an actual
      * change. Should be more thorough by actually comparing the elements.
      */
-    if (a->eth_disable != b->eth_disable) {
+    if (a->is_disabled != b->is_disabled) {
         goto on_exit;
     }
 
-    if (a->eth_static != b->eth_static) {
+    if (a->is_static != b->is_static) {
         goto on_exit;
     }
 
 
-    if (a->eth_static) {
-        if (!ip4_addr_cmp(&(a->eth_ip_info.ip), &(b->eth_ip_info.ip))) {
+    if (a->is_static) {
+        if (!ip4_addr_cmp(&(a->ip_info.ip), &(b->ip_info.ip))) {
             goto on_exit;
         }
 
-        if (!ip4_addr_cmp(&(a->eth_ip_info.netmask), &(b->eth_ip_info.netmask))) {
+        if (!ip4_addr_cmp(&(a->ip_info.netmask), &(b->ip_info.netmask))) {
             goto on_exit;
         }
 
-        if (!ip4_addr_cmp(&(a->eth_ip_info.gw), &(b->eth_ip_info.gw))) {
+        if (!ip4_addr_cmp(&(a->ip_info.gw), &(b->ip_info.gw))) {
             goto on_exit;
         }
 
-        for (idx = 0; idx < ARRAY_SIZE(a->eth_dns_info); ++idx) {
-            if (!ip_addr_cmp(&(a->eth_dns_info[idx].ip),
-                &(b->eth_dns_info[idx].ip)))
+        for (idx = 0; idx < ARRAY_SIZE(a->dns_info); ++idx) {
+            if (!ip_addr_cmp(&(a->dns_info[idx].ip),
+                &(b->dns_info[idx].ip)))
             {
                 goto on_exit;
             }
@@ -426,20 +426,20 @@ static esp_err_t get_eth_state(struct eth_cfg *cfg)
 
     // If DHCP is stopped on Ethernet interface, assume static IP
     if (ESP_NETIF_DHCP_STOPPED == dhcp_status) {
-        cfg->eth_static = 1;
+        cfg->is_static = 1;
     }
 
-    result = esp_netif_get_ip_info(eth_netif, &cfg->eth_ip_info);
+    result = esp_netif_get_ip_info(eth_netif, &cfg->ip_info);
     if (result != ESP_OK) {
         ESP_LOGE(TAG, "[%s] esp_netif_get_ip_info() STA: %d %s",
             __func__, result, esp_err_to_name(result));
         goto on_exit;
     }
 
-    for (idx = 0; idx < ARRAY_SIZE(cfg->eth_dns_info); ++idx) {
+    for (idx = 0; idx < ARRAY_SIZE(cfg->dns_info); ++idx) {
         result = esp_netif_get_dns_info(eth_netif,
             idx,
-            &(cfg->eth_dns_info[idx]));
+            &(cfg->dns_info[idx]));
         if (result != ESP_OK) {
             ESP_LOGE(TAG, "[%s] Getting DNS server IP failed.",
                 __func__);
@@ -625,7 +625,7 @@ esp_err_t eth_manager_get_eth_cfg(struct eth_cfg *new_cfg)
 }
 
 /** Query current connection status.
- * @return true if device is connected to Ethernet, false otherwise
+ * @return
  */
 esp_err_t eth_manager_get_eth_state(struct eth_cfg *get_state)
 {
