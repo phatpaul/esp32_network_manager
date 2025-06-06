@@ -40,7 +40,7 @@ esp_err_t eth_manager_set_eth_cfg(struct eth_cfg *new_cfg);
 esp_err_t eth_manager_get_eth_cfg(struct eth_cfg *get_cfg);
 esp_err_t eth_manager_get_eth_state(struct eth_cfg *get_state);
 esp_err_t eth_manager_set_hostname(const char *hostname);
-esp_err_t eth_manager_init(esp_eth_handle_t *eth_handle);
+esp_err_t eth_manager_init(esp_eth_handle_t eth_handle);
 
 #ifdef __cplusplus
 }

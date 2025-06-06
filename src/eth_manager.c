@@ -54,11 +54,14 @@ static const char *TAG = "eth_manager";
 #define BIT_ETH_START           BIT1
 #define BIT_ETH_CONNECTED       BIT2
 #define BIT_ETH_GOT_IP          BIT3
-#define BIT_STOPPED      BIT10
 
-static esp_netif_t *eth_netif = NULL;
-
-static EventGroupHandle_t eth_events = NULL;
+struct eth_manager_handle_s {
+    struct kref ref_cnt; /*!< Reference count for the handle. */
+    esp_netif_t *eth_netif;
+    esp_eth_handle_t eth_handle;
+    EventGroupHandle_t eth_events;
+};
+static struct eth_manager_handle_s *handle = NULL;
 
 /** Set configuration from compiled-in defaults.
  */
@@ -259,13 +262,58 @@ on_exit:
 static bool eth_connected(void)
 {
     EventBits_t events;
-    if (NULL == eth_events) {
+    if (NULL == handle || NULL == handle->eth_events) {
         ESP_LOGE(TAG, "not initialized");
         return false;
     }
-    events = xEventGroupGetBits(eth_events);
+    events = xEventGroupGetBits(handle->eth_events);
 
     return !!(events & BIT_ETH_CONNECTED);
+}
+
+static esp_err_t start_eth(void)
+{
+    esp_err_t result = ESP_OK;
+
+    if (NULL == handle || NULL == handle->eth_handle || NULL == handle->eth_events) {
+        ESP_LOGE(TAG, "Ethernet Manager not initialized.");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xEventGroupGetBits(handle->eth_events) & BIT_ETH_START) {
+        ESP_LOGI(TAG, "Ethernet already started.");
+        return ESP_OK;
+    }
+
+    // Start the Ethernet driver state machine
+    result = esp_eth_start(handle->eth_handle);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to start Ethernet. %s", esp_err_to_name(result));
+    }
+
+    return result;
+}
+
+esp_err_t stop_eth(void)
+{
+    esp_err_t result = ESP_OK;
+
+    if (NULL == handle || NULL == handle->eth_handle || NULL == handle->eth_events) {
+        ESP_LOGE(TAG, "Ethernet Manager not initialized.");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!(xEventGroupGetBits(handle->eth_events) & BIT_ETH_START)) {
+        ESP_LOGI(TAG, "Ethernet already stopped.");
+        return ESP_OK;
+    }
+
+    // Stop the Ethernet driver state machine
+    result = esp_eth_stop(handle->eth_handle);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to stop Ethernet. %s", esp_err_to_name(result));
+    }
+
+    return result;
 }
 
 /* Helper function to set Ethernet configuration from struct eth_cfg. */
@@ -276,13 +324,25 @@ static esp_err_t set_eth_cfg(struct eth_cfg *cfg)
 
     ESP_LOGD(TAG, "[%s] Called.", __FUNCTION__);
 
-    if (cfg->is_static) {
-        (void)esp_netif_dhcpc_stop(eth_netif);
+    if (cfg->is_disabled)
+    {
+        // Todo disable ethernet interface
+        ESP_LOGI(TAG, "Disabling Ethernet interface.");
+        result = stop_eth();
+        return result; // no need to continue
+    }
+    else {
+        // Todo enable ethernet interface
+        ESP_LOGI(TAG, "Enabling Ethernet interface.");
+        result = start_eth();
+    }
 
-        result = esp_netif_set_ip_info(eth_netif, &cfg->ip_info);
+    if (cfg->is_static) {
+        (void)esp_netif_dhcpc_stop(handle->eth_netif);
+
+        result = esp_netif_set_ip_info(handle->eth_netif, &cfg->ip_info);
         if (result != ESP_OK) {
-            ESP_LOGE(TAG, "[%s] esp_netif_set_ip_info() STA: %d %s",
-                __func__, result, esp_err_to_name(result));
+            ESP_LOGE(TAG, "esp_netif_set_ip_info() STA: %s", esp_err_to_name(result));
         }
 
         for (idx = 0; idx < ARRAY_SIZE(cfg->dns_info); ++idx) {
@@ -290,29 +350,20 @@ static esp_err_t set_eth_cfg(struct eth_cfg *cfg)
                 continue;
             }
 
-            result = esp_netif_set_dns_info(eth_netif,
+            result = esp_netif_set_dns_info(handle->eth_netif,
                 idx,
                 &(cfg->dns_info[idx]));
             if (result != ESP_OK) {
-                ESP_LOGE(TAG, "[%s] Setting DNS server IP failed.",
-                    __func__);
+                ESP_LOGE(TAG, "Setting DNS server IP failed.");
             }
         }
     }
     else {
-        result = esp_netif_dhcpc_start(eth_netif);
+        result = esp_netif_dhcpc_start(handle->eth_netif);
         if (ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED == result) {
             result = ESP_OK;
-            ESP_LOGD(TAG, "[%s] DHCP already started.", __FUNCTION__);
+            ESP_LOGD(TAG, "DHCP already started.");
         }
-    }
-
-    if (cfg->is_disabled)
-    {
-        // Todo disable ethernet interface
-    }
-    else {
-        // Todo enable ethernet interface
     }
 
     return result;
@@ -381,8 +432,7 @@ static esp_err_t get_saved_or_default_config(struct eth_cfg *cfg_state)
      */
     result = get_saved_config(cfg_state);
     if (result != ESP_OK) {
-        ESP_LOGI(TAG, "[%s] No saved config found, setting defaults",
-            __func__);
+        ESP_LOGI(TAG, "No saved config found, setting defaults");
         set_defaults(cfg_state);
         result = ESP_OK;
     }
@@ -418,7 +468,7 @@ static esp_err_t get_eth_state(struct eth_cfg *cfg)
     cfg->is_connected = true;
 
     // See if DHCP is enabled on the Ethernet interface
-    result = esp_netif_dhcpc_get_status(eth_netif, &dhcp_status);
+    result = esp_netif_dhcpc_get_status(handle->eth_netif, &dhcp_status);
     if (result != ESP_OK) {
         ESP_LOGE(TAG, "[%s] Error fetching DHCP status.", __func__);
         goto on_exit;
@@ -429,7 +479,7 @@ static esp_err_t get_eth_state(struct eth_cfg *cfg)
         cfg->is_static = 1;
     }
 
-    result = esp_netif_get_ip_info(eth_netif, &cfg->ip_info);
+    result = esp_netif_get_ip_info(handle->eth_netif, &cfg->ip_info);
     if (result != ESP_OK) {
         ESP_LOGE(TAG, "[%s] esp_netif_get_ip_info() STA: %d %s",
             __func__, result, esp_err_to_name(result));
@@ -437,7 +487,7 @@ static esp_err_t get_eth_state(struct eth_cfg *cfg)
     }
 
     for (idx = 0; idx < ARRAY_SIZE(cfg->dns_info); ++idx) {
-        result = esp_netif_get_dns_info(eth_netif,
+        result = esp_netif_get_dns_info(handle->eth_netif,
             idx,
             &(cfg->dns_info[idx]));
         if (result != ESP_OK) {
@@ -458,18 +508,17 @@ static void eth_event_handler(void *esp_netif, esp_event_base_t event_base,
     int32_t event_id, void *event_data)
 {
 
-
     if (ETH_EVENT == event_base) {
         switch (event_id)
         {
         case ETHERNET_EVENT_CONNECTED:
-            xEventGroupSetBits(eth_events, BIT_ETH_CONNECTED);
+            xEventGroupSetBits(handle->eth_events, BIT_ETH_CONNECTED);
 #if ETH_USE_IPV6
             esp_netif_create_ip6_linklocal(esp_netif);
 #endif // ETH_USE_IPV6
             if (LOG_LOCAL_LEVEL >= ESP_LOG_INFO)
             {
-                uint8_t mac_addr[6] = { 0 };
+                uint8_t mac_addr[6] = {0};
                 /* we can get the ethernet driver handle from event data */
                 esp_eth_handle_t eth_handle = *(esp_eth_handle_t *)event_data;
                 esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, &mac_addr[0]);
@@ -479,14 +528,14 @@ static void eth_event_handler(void *esp_netif, esp_event_base_t event_base,
             break;
         case ETHERNET_EVENT_DISCONNECTED:
             ESP_LOGI(TAG, "Ethernet Link Down");
-            xEventGroupClearBits(eth_events, BIT_ETH_CONNECTED);
+            xEventGroupClearBits(handle->eth_events, BIT_ETH_CONNECTED);
             break;
         case ETHERNET_EVENT_START:
-            xEventGroupSetBits(eth_events, BIT_ETH_START);
+            xEventGroupSetBits(handle->eth_events, BIT_ETH_START);
             ESP_LOGI(TAG, "Ethernet Started");
             break;
         case ETHERNET_EVENT_STOP:
-            xEventGroupClearBits(eth_events, BIT_ETH_START);
+            xEventGroupClearBits(handle->eth_events, BIT_ETH_START);
             ESP_LOGI(TAG, "Ethernet Stopped");
             break;
         default:
@@ -497,16 +546,17 @@ static void eth_event_handler(void *esp_netif, esp_event_base_t event_base,
     // if (IP_EVENT == event_base) {
     //     switch (event_id) {
     //     case IP_EVENT_STA_GOT_IP:
-    //         xEventGroupSetBits(eth_events, BIT_ETH_GOT_IP);
+    //         xEventGroupSetBits(handle->eth_events, BIT_ETH_GOT_IP);
     //         break;
     //     case IP_EVENT_STA_LOST_IP:
-    //         xEventGroupClearBits(eth_events, BIT_ETH_GOT_IP);
+    //         xEventGroupClearBits(handle->eth_events, BIT_ETH_GOT_IP);
     //         break;
     //     default:
     //         break;
     //     }
     // }
 }
+
 
 /*****************************************************************************\
  *  API functions                                                            *
@@ -521,40 +571,44 @@ static void eth_event_handler(void *esp_netif, esp_event_base_t event_base,
  * @param eth_handle Pointer to the Ethernet handle which was created by esp_eth_driver_install()
  * @return int 0: success, other: error code
  */
-esp_err_t eth_manager_init(esp_eth_handle_t *eth_handle)
+esp_err_t eth_manager_init(esp_eth_handle_t eth_handle)
 {
-
-    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
     esp_err_t result = ESP_OK;
 
-    configASSERT(eth_handle != NULL);
-    configASSERT(eth_events == NULL);
-
-    eth_events = xEventGroupCreate();
-    if (NULL == eth_events) {
-        ESP_LOGE(TAG, "Unable to create event group.");
+    if (NULL != handle) {
+        ESP_LOGE(TAG, "Ethernet Manager already initialized.");
+        return ESP_ERR_INVALID_STATE;
+    }
+    handle = calloc(1, sizeof(*handle));
+    if (NULL == handle) {
         result = ESP_ERR_NO_MEM;
         goto on_exit;
     }
 
-    /* Make sure we do not handle any events until we have been started. */
-    xEventGroupSetBits(eth_events, BIT_STOPPED);
+    kref_init(&(handle->ref_cnt)); // initialises ref_cnt to 1
+    handle->eth_handle = eth_handle;
 
+    handle->eth_events = xEventGroupCreate();
+    if (NULL == handle->eth_events) {
+        result = ESP_ERR_NO_MEM;
+        goto on_exit;
+    }
 
-    eth_netif = esp_netif_new(&cfg);
-    if (NULL == eth_netif)
+    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
+    handle->eth_netif = esp_netif_new(&cfg);
+    if (NULL == handle->eth_netif)
     {
         goto on_exit;
     }
     // Set default handlers to process TCP/IP stuffs -- NOT NEEDED in IDF v4+
-    // err = esp_eth_set_default_handlers(eth_netif);
+    // err = esp_eth_set_default_handlers(handle->eth_netif);
     // if (err != 0)
     // {
     //     goto on_exit;
     // }
 
     /* attach Ethernet driver to TCP/IP stack */
-    result = esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle));
+    result = esp_netif_attach(handle->eth_netif, esp_eth_new_netif_glue(handle->eth_handle));
     if (ESP_OK != result)
     {
         goto on_exit;
@@ -563,14 +617,8 @@ esp_err_t eth_manager_init(esp_eth_handle_t *eth_handle)
     result = esp_event_handler_instance_register(ETH_EVENT,
         ESP_EVENT_ANY_ID,
         &eth_event_handler,
-        eth_netif,
+        handle->eth_netif,
         NULL);
-    if (ESP_OK != result)
-    {
-        goto on_exit;
-    }
-    /* start Ethernet driver state machine */
-    result = esp_eth_start(eth_handle);
     if (ESP_OK != result)
     {
         goto on_exit;
@@ -592,13 +640,16 @@ esp_err_t eth_manager_init(esp_eth_handle_t *eth_handle)
 
 on_exit:
     if (result != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to start Ethernet. code:%d", result);
-        if (eth_events != NULL) {
-            vEventGroupDelete(eth_events);
-            eth_events = NULL;
+        ESP_LOGW(TAG, "Failed to start Ethernet. %s", esp_err_to_name(result));
+        if (NULL != handle) {
+            if (handle->eth_events != NULL) {
+                vEventGroupDelete(handle->eth_events);
+                handle->eth_events = NULL;
+            }
+            free(handle);
+            handle = NULL;
         }
     }
-
     return result;
 }
 
@@ -637,13 +688,12 @@ esp_err_t eth_manager_set_hostname(const char *hostname)
 {
     esp_err_t err = ESP_OK;
 
-    if (eth_netif == NULL)
-    {
-        ESP_LOGE(TAG, "Ethernet interface not initialized");
-        return ESP_FAIL;
+    if (NULL == handle || NULL == handle->eth_netif) {
+        ESP_LOGE(TAG, "Ethernet Manager not initialized.");
+        return ESP_ERR_INVALID_STATE;
     }
 
-    err = esp_netif_set_hostname(eth_netif, hostname);
+    err = esp_netif_set_hostname(handle->eth_netif, hostname);
     if (err != 0)
     {
         ESP_LOGE(TAG, "Failed to set hostname: %s", esp_err_to_name(err));
