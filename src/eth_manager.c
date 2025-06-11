@@ -331,11 +331,6 @@ static esp_err_t set_eth_cfg(struct eth_cfg *cfg)
         result = stop_eth();
         return result; // no need to continue
     }
-    else {
-        // Todo enable ethernet interface
-        ESP_LOGI(TAG, "Enabling Ethernet interface.");
-        result = start_eth();
-    }
 
     if (cfg->is_static) {
         (void)esp_netif_dhcpc_stop(handle->eth_netif);
@@ -365,6 +360,10 @@ static esp_err_t set_eth_cfg(struct eth_cfg *cfg)
             ESP_LOGD(TAG, "DHCP already started.");
         }
     }
+
+    // Enable ethernet interface
+    ESP_LOGI(TAG, "Enabling Ethernet interface.");
+    result = start_eth();
 
     return result;
 }
