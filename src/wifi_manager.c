@@ -37,6 +37,7 @@
 #include "nvs_flash.h"
 //#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #include "esp_log.h"
+#include <inttypes.h>
 
 #include "lwip/ip4.h"
 #include "lwip/ip_addr.h"
@@ -108,7 +109,7 @@ static esp_netif_t* ap_netif = NULL;
 
 static EventGroupHandle_t wifi_events = NULL;
 
-static TimerHandle_t *config_timer = NULL;
+static TimerHandle_t config_timer = NULL;
 
 static void handle_timer(TimerHandle_t timer);
 static void event_handler(void* args, esp_event_base_t base,
@@ -1169,7 +1170,7 @@ on_exit:
 
     xSemaphoreGive(cfg_state.lock);
 
-    ESP_LOGD(TAG, "[%s] Leaving. State: %s delay: %d",
+    ESP_LOGD(TAG, "[%s] Leaving. State: %s delay: %" PRIu32,
              __func__, wmngr_state_names[cfg_state.state], delay);
 
     return;
