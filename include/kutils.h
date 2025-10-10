@@ -10,16 +10,18 @@
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details. 
- *              
+ * GNU General Public License for more details.
+ *
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
  * MA  02110-1301, USA.
- */  
+ */
 
 #ifndef KUTILS_H
 #define KUTILS_H
+
+#include "freertos/FreeRTOS.h"  // For TickType_t
 
 /* This is a collection of various macros taken from the Linux kernel. */
 
@@ -46,14 +48,14 @@
 })
 
 #define time_after(a, b)            \
-    (typecheck(unsigned int, a) &&  \
-     typecheck(unsigned int, b) &&  \
+    (typecheck(TickType_t, a) &&  \
+     typecheck(TickType_t, b) &&  \
      ((long)((b) - (a)) < 0))
 #define time_before(a, b)       time_after(b, a)
 
 #define time_after_eq(a, b)         \
-    (typecheck(unsigned long, a) && \
-     typecheck(unsigned long, b) && \
+    (typecheck(TickType_t, a) && \
+     typecheck(TickType_t, b) && \
      ((long)((a) - (b)) >= 0))
 #define time_before_eq(a, b)    time_after_eq(b, a)
 

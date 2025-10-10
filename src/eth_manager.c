@@ -368,7 +368,7 @@ static esp_err_t set_eth_cfg(struct eth_cfg *cfg)
     return result;
 }
 
-static bool cfgs_are_equal(struct eth_cfg *a, struct eth_cfg *b)
+bool cfgs_are_equal(struct eth_cfg *a, struct eth_cfg *b)
 {
     unsigned int idx;
     bool result;
